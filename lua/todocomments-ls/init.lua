@@ -89,6 +89,17 @@ local function find_keyword(line)
   end
 end
 
+local function collect_comments(node, ranges)
+  if node:type():find("comment") then
+    local sr, sc, er, ec = node:range()
+    table.insert(ranges, { sr, sc, er, ec })
+    return
+  end
+  for child in node:iter_children() do
+    collect_comments(child, ranges)
+  end
+end
+
 local function get_comment_ranges(text, lang)
   local ok, parser = pcall(vim.treesitter.get_string_parser, text, lang)
   if not ok then
@@ -96,18 +107,8 @@ local function get_comment_ranges(text, lang)
   end
   parser:parse()
   local ranges = {}
-  parser:for_each_tree(function(tstree, ltree)
-    local root = tstree:root()
-    local query = vim.treesitter.query.get(ltree:lang(), "highlights")
-    if not query then
-      return
-    end
-    for id, node in query:iter_captures(root, text) do
-      if query.captures[id]:find("^comment") then
-        local sr, sc, er, ec = node:range()
-        table.insert(ranges, { sr, sc, er, ec })
-      end
-    end
+  parser:for_each_tree(function(tstree)
+    collect_comments(tstree:root(), ranges)
   end)
   return ranges
 end
@@ -150,13 +151,20 @@ local function scan(text, lang)
 end
 
 local documents = {}
+local scan_cache = {}
 
 local function scan_buf(uri)
   local doc = documents[uri]
   if not doc then
     return {}
   end
-  return scan(doc.text, doc.lang)
+  local cached = scan_cache[uri]
+  if cached and cached.text == doc.text then
+    return cached.results
+  end
+  local results = scan(doc.text, doc.lang)
+  scan_cache[uri] = { text = doc.text, results = results }
+  return results
 end
 
 local function publish_diagnostics(self, uri, version)
@@ -194,7 +202,9 @@ M.notifications["textDocument/didChange"] = function(self, params)
 end
 
 M.notifications["textDocument/didClose"] = function(_, params)
-  documents[params.textDocument.uri] = nil
+  local uri = params.textDocument.uri
+  documents[uri] = nil
+  scan_cache[uri] = nil
 end
 
 M.requests["textDocument/documentColor"] = function(_, params)
@@ -208,4 +218,18 @@ M.requests["textDocument/documentColor"] = function(_, params)
   return colors
 end
 
-return M:build()
+local built = M:build()
+built.bench = function(n)
+  n = n or 100
+  for uri, doc in pairs(documents) do
+    scan_cache[uri] = nil
+    local t0 = vim.uv.hrtime()
+    for _ = 1, n do
+      scan_cache[uri] = nil
+      scan(doc.text, doc.lang)
+    end
+    local avg = (vim.uv.hrtime() - t0) / 1e6 / n
+    vim.notify(("%s: %.2fms avg (%d runs)"):format(vim.uri_to_fname(uri), avg, n))
+  end
+end
+return built
