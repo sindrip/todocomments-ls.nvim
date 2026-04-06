@@ -90,6 +90,9 @@ function Server:build()
 
   return {
     cmd = function(dispatchers)
+      dispatchers.notification = vim.schedule_wrap(dispatchers.notification)
+      dispatchers.on_error = vim.schedule_wrap(dispatchers.on_error)
+
       local srv = setmetatable({
         dispatchers = dispatchers,
         closing = false,
@@ -97,8 +100,9 @@ function Server:build()
       }, { __index = proto })
 
       return {
-        request = function(...)
-          return srv:handle_request(...)
+        request = function(method, params, callback, notify_reply_callback)
+          return srv:handle_request(method, params, vim.schedule_wrap(callback),
+            notify_reply_callback and vim.schedule_wrap(notify_reply_callback))
         end,
 
         notify = function(...)

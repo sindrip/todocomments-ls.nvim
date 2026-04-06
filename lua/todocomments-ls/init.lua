@@ -14,9 +14,9 @@ local function hl_color(name)
     return nil
   end
   return {
-    red = bit.rshift(bit.band(color, 0xFF0000), 16) / 255,
-    green = bit.rshift(bit.band(color, 0x00FF00), 8) / 255,
-    blue = bit.band(color, 0x0000FF) / 255,
+    red = math.floor(color / 0x10000) % 0x100 / 255,
+    green = math.floor(color / 0x100) % 0x100 / 255,
+    blue = color % 0x100 / 255,
     alpha = 1,
   }
 end
@@ -118,8 +118,7 @@ local function in_comment(ranges, row, col)
     return true
   end
   for _, r in ipairs(ranges) do
-    if (row > r[1] or (row == r[1] and col >= r[2]))
-      and (row < r[3] or (row == r[3] and col < r[4])) then
+    if (row > r[1] or (row == r[1] and col >= r[2])) and (row < r[3] or (row == r[3] and col < r[4])) then
       return true
     end
   end
@@ -142,7 +141,7 @@ local function scan(text, lang)
         message = message ~= "" and (name .. ": " .. message) or name,
         severity = cfg.severity,
         color = hl_color(cfg.hl or sev_hl[cfg.severity]),
-        source = "todocomments-ls",
+        source = M.name,
       })
     end
   end
@@ -193,12 +192,12 @@ end
 
 M.notifications["textDocument/didChange"] = function(self, params)
   local td = params.textDocument
-  if params.contentChanges[1] then
-    documents[td.uri].text = params.contentChanges[1].text
+  local doc = documents[td.uri]
+  if not doc or not params.contentChanges[1] then
+    return
   end
-  vim.schedule(function()
-    publish_diagnostics(self, td.uri, td.version)
-  end)
+  doc.text = params.contentChanges[1].text
+  publish_diagnostics(self, td.uri, td.version)
 end
 
 M.notifications["textDocument/didClose"] = function(_, params)
@@ -218,18 +217,4 @@ M.requests["textDocument/documentColor"] = function(_, params)
   return colors
 end
 
-local built = M:build()
-built.bench = function(n)
-  n = n or 100
-  for uri, doc in pairs(documents) do
-    scan_cache[uri] = nil
-    local t0 = vim.uv.hrtime()
-    for _ = 1, n do
-      scan_cache[uri] = nil
-      scan(doc.text, doc.lang)
-    end
-    local avg = (vim.uv.hrtime() - t0) / 1e6 / n
-    vim.notify(("%s: %.2fms avg (%d runs)"):format(vim.uri_to_fname(uri), avg, n))
-  end
-end
-return built
+return M:build()
