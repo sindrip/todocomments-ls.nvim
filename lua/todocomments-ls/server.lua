@@ -54,19 +54,25 @@ function Server.new(name)
   }, { __index = Server })
 end
 
-function Server:handle_request(method, params, callback)
+function Server:handle_request(method, params, callback, notify_reply_callback)
   self.request_id = self.request_id + 1
 
   local handler = self.requests[method]
   if handler then
-    local result, err = handler(self, params)
-    if err then
+    local ok, result, err = pcall(handler, self, params)
+    if not ok then
+      callback({ code = -32603, message = tostring(result) }, nil)
+    elseif err then
       callback({ code = -32603, message = err }, nil)
     else
       callback(nil, result or {})
     end
   else
     callback({ code = -32601, message = "Method not found: " .. method }, nil)
+  end
+
+  if notify_reply_callback then
+    notify_reply_callback(self.request_id)
   end
 
   return true, self.request_id

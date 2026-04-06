@@ -3,19 +3,20 @@ local Server = require("todocomments-ls.server")
 local M = Server.new("todocomments-ls")
 
 M.capabilities = {
-  diagnosticProvider = {},
+  textDocumentSync = { change = 1, openClose = true },
   colorProvider = true,
 }
 
 local function hl_color(name)
   local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
-  if not hl.fg then
+  local color = hl.fg or hl.sp
+  if not color then
     return nil
   end
   return {
-    red = bit.rshift(bit.band(hl.fg, 0xFF0000), 16) / 255,
-    green = bit.rshift(bit.band(hl.fg, 0x00FF00), 8) / 255,
-    blue = bit.band(hl.fg, 0x0000FF) / 255,
+    red = bit.rshift(bit.band(color, 0xFF0000), 16) / 255,
+    green = bit.rshift(bit.band(color, 0x00FF00), 8) / 255,
+    blue = bit.band(color, 0x0000FF) / 255,
     alpha = 1,
   }
 end
@@ -88,33 +89,54 @@ local function find_keyword(line)
   end
 end
 
-local function in_comment(bufnr, row, col)
-  local captures = vim.treesitter.get_captures_at_pos(bufnr, row, col)
-  for _, c in ipairs(captures) do
-    if c.capture:find("^comment") then
+local function get_comment_ranges(text, lang)
+  local ok, parser = pcall(vim.treesitter.get_string_parser, text, lang)
+  if not ok then
+    return nil
+  end
+  parser:parse()
+  local ranges = {}
+  parser:for_each_tree(function(tstree, ltree)
+    local root = tstree:root()
+    local query = vim.treesitter.query.get(ltree:lang(), "highlights")
+    if not query then
+      return
+    end
+    for id, node in query:iter_captures(root, text) do
+      if query.captures[id]:find("^comment") then
+        local sr, sc, er, ec = node:range()
+        table.insert(ranges, { sr, sc, er, ec })
+      end
+    end
+  end)
+  return ranges
+end
+
+local function in_comment(ranges, row, col)
+  if not ranges then
+    return true
+  end
+  for _, r in ipairs(ranges) do
+    if (row > r[1] or (row == r[1] and col >= r[2]))
+      and (row < r[3] or (row == r[3] and col < r[4])) then
       return true
     end
   end
   return false
 end
 
-local function scan(uri)
-  local bufnr = vim.uri_to_bufnr(uri)
-  if not vim.api.nvim_buf_is_loaded(bufnr) then
-    return {}
-  end
-
-  local has_ts = vim.treesitter.get_parser(bufnr, nil, { error = false }) ~= nil
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+local function scan(text, lang)
+  local comment_ranges = get_comment_ranges(text, lang)
+  local lines = vim.split(text, "\n", { plain = true })
   local results = {}
 
   for i, line in ipairs(lines) do
     local s, e, name, cfg, message = find_keyword(line)
-    if s and (not has_ts or in_comment(bufnr, i - 1, s - 1)) then
+    if s and in_comment(comment_ranges, i - 1, s - 1) then
       table.insert(results, {
         range = {
-          start = { line = i - 1, character = s - 1 },
-          ["end"] = { line = i - 1, character = e },
+          start = { line = i - 1, character = math.max(0, s - 2) },
+          ["end"] = { line = i - 1, character = e + 1 },
         },
         message = message ~= "" and (name .. ": " .. message) or name,
         severity = cfg.severity,
@@ -127,8 +149,18 @@ local function scan(uri)
   return results
 end
 
-M.requests["textDocument/diagnostic"] = function(_, params)
-  local results = scan(params.textDocument.uri)
+local documents = {}
+
+local function scan_buf(uri)
+  local doc = documents[uri]
+  if not doc then
+    return {}
+  end
+  return scan(doc.text, doc.lang)
+end
+
+local function publish_diagnostics(self, uri, version)
+  local results = scan_buf(uri)
   local items = {}
   for _, r in ipairs(results) do
     table.insert(items, {
@@ -138,20 +170,40 @@ M.requests["textDocument/diagnostic"] = function(_, params)
       source = r.source,
     })
   end
-  return { kind = "full", items = items }
+  self.dispatchers.notification("textDocument/publishDiagnostics", {
+    uri = uri,
+    version = version,
+    diagnostics = items,
+  })
+end
+
+M.notifications["textDocument/didOpen"] = function(self, params)
+  local td = params.textDocument
+  documents[td.uri] = { text = td.text, lang = td.languageId }
+  publish_diagnostics(self, td.uri, td.version)
+end
+
+M.notifications["textDocument/didChange"] = function(self, params)
+  local td = params.textDocument
+  if params.contentChanges[1] then
+    documents[td.uri].text = params.contentChanges[1].text
+  end
+  vim.schedule(function()
+    publish_diagnostics(self, td.uri, td.version)
+  end)
+end
+
+M.notifications["textDocument/didClose"] = function(_, params)
+  documents[params.textDocument.uri] = nil
 end
 
 M.requests["textDocument/documentColor"] = function(_, params)
-  local results = scan(params.textDocument.uri)
+  local results = scan_buf(params.textDocument.uri)
   local colors = {}
   for _, r in ipairs(results) do
-    table.insert(colors, {
-      range = {
-        start = { line = r.range.start.line, character = math.max(0, r.range.start.character - 1) },
-        ["end"] = { line = r.range["end"].line, character = r.range["end"].character + 1 },
-      },
-      color = r.color,
-    })
+    if r.color then
+      table.insert(colors, { range = r.range, color = r.color })
+    end
   end
   return colors
 end
